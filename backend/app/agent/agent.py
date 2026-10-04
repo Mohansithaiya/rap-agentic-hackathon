@@ -63,13 +63,27 @@ class InventoryAgent:
         reorder_needed = inventory.quantity <= inventory.reorder_level
         decision = "at or below" if reorder_needed else "above"
         action = "reorder is needed" if reorder_needed else "reorder is not needed"
+        details_outcome = self.harness.execute(
+            tools.get_product_details, product, tool_name="get_product_details"
+        )
+        if details_outcome.success:
+            details = details_outcome.result
+            explanation = (
+                f"{inventory.product} has quantity {inventory.quantity}, {decision} "
+                f"the reorder level of {inventory.reorder_level}; {action}. "
+                f"It is a {details.category} product: {details.description} "
+                f"Unit price: ${details.unit_price:.2f}."
+            )
+        else:
+            explanation = (
+                f"{inventory.product} has quantity {inventory.quantity}, {decision} "
+                f"the reorder level of {inventory.reorder_level}; {action}. "
+                f"Product details were unavailable: {details_outcome.error}"
+            )
         return InventoryResponse(
             product=inventory.product,
             quantity=inventory.quantity,
             reorder_level=inventory.reorder_level,
             reorder_needed=reorder_needed,
-            explanation=(
-                f"{inventory.product} has quantity {inventory.quantity}, {decision} "
-                f"the reorder level of {inventory.reorder_level}; {action}."
-            ),
+            explanation=explanation,
         )
