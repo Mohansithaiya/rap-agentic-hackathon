@@ -89,6 +89,91 @@ def test_four_document_tools_question_searches_for_returns_and_reads_matching_pa
     assert result.evidence.pages_read[0]["text"] == tool_reference
 
 
+def test_tool_call_limit_question_reads_hard_constraints_page_and_cites_it(monkeypatch):
+    from app.documents.models import Heading, HeadingsResult, SearchResult
+
+    generic_constraints = "Hard constraints also require deterministic output and PDF-only access."
+    limit_text = (
+        "The maximum number of document tool calls allowed per question is 6. "
+        "The separate final answer call is not a document-tool call."
+    )
+    document_pages = {
+        1: "Document tools and their return values.",
+        2: generic_constraints,
+        3: limit_text,
+    }
+    calls = []
+    monkeypatch.setattr("app.documents.harness.tools.list_headings", lambda doc_id:
+                        HeadingsResult(doc_id=doc_id, headings=[
+                            Heading(title="Document Tools", level=1, page_number=1),
+                            Heading(title="Hard Constraints", level=1, page_number=2),
+                        ]))
+    monkeypatch.setattr("app.documents.harness.tools.search_keyword", lambda doc_id, keyword:
+                        calls.append(("search_keyword", keyword)) or SearchResult(
+                            doc_id=doc_id, keyword=keyword,
+                            page_numbers=[number for number, text in document_pages.items()
+                                          if keyword.casefold() in text.casefold()]))
+    monkeypatch.setattr("app.documents.harness.tools.get_page", lambda doc_id, page_number:
+                        calls.append(("get_page", page_number)) or PageResult(
+                            doc_id=doc_id, page_number=page_number, text=document_pages[page_number]))
+    answer = "The maximum number of document tool calls allowed per question is six [p. 3]."
+    llm = FakeLLM([], answer=answer)
+
+    result = DocumentAgent(DocumentHarness(), llm).run(
+        "What is the maximum number of tool calls allowed per question?", document_id="d1")
+
+    assert [page["page_number"] for page in result.evidence.pages_read] == [2, 3]
+    assert "six" in result.answer.casefold() or "6" in result.answer
+    assert "[p. 3]" in result.answer
+    assert calls == [("get_page", 2), ("search_keyword", "maximum"), ("get_page", 3)]
+    assert [event.tool_name for event in result.trace] == [
+        "list_headings", "get_page", "search_keyword", "get_page", "final_answer"
+    ]
+    assert result.calls_made == 4 <= DocumentHarness.MAX_CALLS == 6
+    diagnostics = result.trace[-1].result_metadata["diagnostics"]
+    assert diagnostics["validation_result"] == "accepted"
+    assert diagnostics["budget_evidence_checks"] == [
+        {"page_number": 2, "contains_tool_call_limit_and_quantity": False},
+        {"page_number": 3, "contains_tool_call_limit_and_quantity": True},
+    ]
+
+
+def test_validator_normalizes_numeric_words_but_rejects_wrong_call_limit():
+    from app.documents.agent import EvidenceState
+
+    evidence = EvidenceState(pages_read=[{
+        "doc_id": "d1", "page_number": 3,
+        "text": "The maximum number of document tool calls allowed per question is 6.",
+    }])
+    question = "What is the maximum number of tool calls allowed per question?"
+    supported = "The maximum number of document tool calls allowed per question is six [p. 3]."
+    unsupported = "The maximum number of document tool calls allowed per question is seven [p. 3]."
+    diagnostics = {}
+
+    assert DocumentAgent._validated_answer(supported, question, evidence) == supported
+    assert DocumentAgent._validated_answer(unsupported, question, evidence, diagnostics) == "Insufficient information."
+    assert diagnostics["failed_condition"] == "tool-call quantity is not supported by cited budget evidence"
+    assert diagnostics["unsupported_answer_terms"] == ["7"]
+
+
+def test_budget_paraphrases_are_grounded_in_cited_total_tool_call_budget():
+    from app.documents.agent import EvidenceState
+
+    evidence = EvidenceState(pages_read=[{
+        "doc_id": "d1", "page_number": 2,
+        "text": "Total tool call budget: 6 tool calls per question, plus 1 final answer call.",
+    }])
+    question = "What is the maximum number of tool calls allowed per question?"
+    answers = [
+        "The maximum number of tool calls is 6 tool calls per question [p. 2].",
+        "The tool-call limit is 6 tool calls per question [p. 2].",
+        "The total tool call budget is 6 tool calls per question, plus 1 final answer call [p. 2].",
+    ]
+
+    for answer in answers:
+        assert DocumentAgent._validated_answer(answer, question, evidence) == answer
+
+
 def test_multi_part_search_reads_found_page_before_another_discovery(monkeypatch):
     from app.documents.models import SearchResult
     calls = []
@@ -565,9 +650,9 @@ def test_transient_planner_failure_uses_harness_fallback_and_exact_evidence(monk
 
     assert result.answer == "A maximum of six document tool calls is allowed per question. [p. 1]"
     assert result.calls_made <= 6
-    assert result.calls_made == 4
+    assert result.calls_made == 5
     assert {event.tool_name for event in result.trace if event.tool_name not in {"agent_decision"}} <= {
-        "search_keyword", "get_page", "list_documents"
+        "search_keyword", "get_page", "list_documents", "list_headings"
     }
     assert all(event.success for event in result.trace if event.tool_name in {"search_keyword", "get_page"})
 

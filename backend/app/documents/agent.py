@@ -54,6 +54,73 @@ class DocumentAgent:
                     and re.search(r"\b(each|every|all|complete|provided|available|inventory|list|four)\b", normalized)
                     and re.search(r"\b(return|returns|output|outputs|does|provide|provided)\b", normalized))
 
+    @staticmethod
+    def _tool_budget_question(question: str) -> bool:
+        normalized = question.casefold()
+        asks_about_calls = bool(re.search(r"\btool[- ]calls?\b|\bcalls?\b", normalized))
+        asks_about_limit = bool(re.search(
+            r"\b(max(?:imum)?|limit|budget|constraint|allowed|six|6)\b", normalized
+        ))
+        return asks_about_calls and asks_about_limit
+
+    @staticmethod
+    def _constraint_page(evidence: EvidenceState) -> int | None:
+        """Select an unread page whose heading identifies constraints or call limits."""
+        candidates: list[tuple[int, int]] = []
+        read_pages = {int(page["page_number"]) for page in evidence.pages_read if "page_number" in page}
+        for result in evidence.headings_results:
+            for heading in result.get("headings", []):
+                title = str(heading.get("title", ""))
+                normalized = title.casefold()
+                if "hard constraint" in normalized:
+                    score = 4
+                elif "constraint" in normalized:
+                    score = 3
+                elif "budget" in normalized or re.search(r"\btool[- ]calls?\b", normalized):
+                    score = 2
+                elif re.search(r"\b(?:call|tool) limits?\b", normalized):
+                    score = 1
+                else:
+                    continue
+                page_number = int(heading["page_number"])
+                if page_number not in read_pages:
+                    candidates.append((score, page_number))
+        return max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))[1] if candidates else None
+
+    @staticmethod
+    def _page_supports_tool_budget(text: str) -> bool:
+        """Recognize page text that states a numeric tool-call limit."""
+        terms = set(re.findall(r"[a-z0-9]+", text.casefold()))
+        has_tool_calls = "tool" in terms and bool(terms & {"call", "calls"})
+        has_limit = bool(terms & {"max", "maximum", "limit", "budget", "constraint", "allowed", "allow"})
+        has_quantity = bool(terms & {
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+            "eighteen", "nineteen", "twenty",
+        })
+        return has_tool_calls and has_limit and has_quantity
+
+    @staticmethod
+    def _tool_call_quantities(text: str) -> set[str]:
+        """Extract numeric quantities stated close to a tool-call phrase."""
+        number_words = {
+            "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+            "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+            "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19", "twenty": "20",
+        }
+        quantities = set()
+        for clause in re.split(r"[,;.!?\n]+", text.casefold()):
+            terms = [number_words.get(term, term) for term in re.findall(r"\d+|[a-z]+", clause)]
+            for index, term in enumerate(terms):
+                if not term.isdigit():
+                    continue
+                window = terms[max(0, index - 6):index + 7]
+                if "tool" in window and ("call" in window or "calls" in window):
+                    quantities.add(term)
+        return quantities
+
     @classmethod
     def _tool_inventory_page(cls, question: str, evidence: EvidenceState) -> int | None:
         """Choose a page from headings that best matches the requested tool inventory."""
@@ -127,25 +194,61 @@ class DocumentAgent:
             return rejected("answer cites a page absent from pages_read")
         # Validate content words rather than numbering, punctuation, or answer framing.
         # Citation parsing and page membership checks above remain strict and unchanged.
-        words = lambda value: set(re.findall(r"[a-z]+", value.casefold()))
+        number_words = {
+            "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+            "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+            "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19", "twenty": "20",
+        }
+        def words(value: str) -> set[str]:
+            return {number_words.get(term, term) for term in re.findall(r"\d+|[a-z]+", value.casefold())}
+
         stop = {
             "the", "and", "for", "with", "that", "this", "was", "were", "are", "is", "of", "in", "on",
             "to", "a", "an", "it", "as", "by", "from", "what", "which", "who", "when", "where", "how",
             "do", "does", "did", "be", "been", "has", "have", "had", "i", "we", "they", "you", "their",
-            "its", "also", "then", "than", "but", "or", "so", "each", "every", "all", "four", "one", "two",
-            "three", "five", "six", "seven", "eight", "nine", "ten", "first", "second", "third", "provided",
+            "its", "also", "then", "than", "but", "or", "so", "each", "every", "all", "first", "second", "third", "number", "provided",
             "available", "following", "below", "above", "answer", "answers", "tool", "tools", "function",
             "functions", "agent", "respectively", "following", "returning", "called", "named",
         }
         question_terms = words(question) - stop
         cited_text = " ".join(pages[number] for number in cited)
         evidence_terms = words(cited_text)
-        answer_terms = words(re.sub(r"\[(?:p\.|page)\s*\d+\]", "", answer, flags=re.IGNORECASE)) - stop
+        answer_text = re.sub(r"\[(?:p\.|page)\s*\d+\]", "", answer, flags=re.IGNORECASE)
+        answer_text = re.sub(r"(?m)^\s*\d+[.)]\s*", "", answer_text)
+        answer_terms = words(answer_text) - stop
         if not question_terms.intersection(evidence_terms):
             return rejected("no question-term overlap with cited evidence")
         unsupported_terms = answer_terms - evidence_terms
         if not answer_terms:
             return rejected("answer has no verifiable content terms")
+        evidence_has_budget_context = (
+            "tool" in evidence_terms
+            and bool(evidence_terms & {"call", "calls"})
+            and bool(evidence_terms & {"budget", "limit", "maximum", "max", "total", "allowed", "allow"})
+        )
+        answer_call_quantities = DocumentAgent._tool_call_quantities(answer_text)
+        evidence_call_quantities = DocumentAgent._tool_call_quantities(cited_text)
+        budget_claim_supported = (
+            DocumentAgent._tool_budget_question(question)
+            and evidence_has_budget_context
+            and bool(answer_call_quantities)
+            and answer_call_quantities.issubset(evidence_call_quantities)
+        )
+        if (DocumentAgent._tool_budget_question(question) and answer_call_quantities
+                and not budget_claim_supported):
+            if diagnostics is not None:
+                diagnostics["answer_tool_call_quantities"] = sorted(answer_call_quantities)
+                diagnostics["evidence_tool_call_quantities"] = sorted(evidence_call_quantities)
+                diagnostics["unsupported_answer_terms"] = sorted(
+                    answer_call_quantities - evidence_call_quantities
+                )
+            return rejected("tool-call quantity is not supported by cited budget evidence")
+        if budget_claim_supported:
+            # These are paraphrases of the source's budget wording. Only allow the
+            # aliases in this supported, quantity-checked tool-budget context.
+            unsupported_terms -= {"maximum", "max", "limit", "total", "budget", "allowed", "allow",
+                                  "document", "documents"}
         if unsupported_terms:
             if diagnostics is not None:
                 diagnostics["unsupported_answer_terms"] = sorted(unsupported_terms)
@@ -270,7 +373,40 @@ class DocumentAgent:
         attempted_searches: dict[str, list[frozenset[str]]] = {}
         located_unread_pages: list[tuple[str, int]] = []
         for _ in range(7):
-            if (self._tool_inventory_question(question) and document_id and not evidence.keyword_searches):
+            if (self._tool_budget_question(question) and document_id and not evidence.headings_results
+                    and not any(event.tool_name == "list_headings" for event in run.trace)):
+                action = DocumentAction(action_type="tool", tool_name="list_headings",
+                                        arguments={"doc_id": document_id},
+                                        reason="Locate the hard-constraints or call-budget section")
+            elif (self._tool_budget_question(question) and evidence.pages_read
+                  and any(self._page_supports_tool_budget(str(page.get("text", "")))
+                          for page in evidence.pages_read)):
+                break
+            elif self._tool_budget_question(question) and evidence.headings_results:
+                page_number = self._constraint_page(evidence)
+                if page_number is not None:
+                    action = DocumentAction(action_type="tool", tool_name="get_page",
+                                            arguments={"doc_id": document_id, "page_number": page_number},
+                                            reason="Read the page headed with the relevant constraints")
+                else:
+                    read_pages = {
+                        (str(page.get("doc_id", "")).casefold(), int(page["page_number"]))
+                        for page in evidence.pages_read if "page_number" in page
+                    }
+                    pending = next((item for item in located_unread_pages
+                                    if item not in read_pages), None)
+                    if pending is not None:
+                        action = DocumentAction(action_type="tool", tool_name="get_page",
+                                                arguments={"doc_id": pending[0], "page_number": pending[1]},
+                                                reason="Read a page located by budget-term search")
+                    elif len(evidence.keyword_searches) < 2:
+                        keyword = "maximum" if not evidence.keyword_searches else "tool calls"
+                        action = DocumentAction(action_type="tool", tool_name="search_keyword",
+                                                arguments={"doc_id": document_id, "keyword": keyword},
+                                                reason="Locate the tool-call limit in page text")
+                    else:
+                        break
+            elif (self._tool_inventory_question(question) and document_id and not evidence.keyword_searches):
                 # A return-oriented lexical query locates the interface descriptions
                 # without reading unrelated constraint pages. Search returns locations
                 # only; the matching page is read in the next step through the harness.
@@ -363,8 +499,9 @@ class DocumentAgent:
             evidence.tool_trace = [event.model_dump() for event in run.trace]
             try:
                 provider_answer = llm.answer(question, evidence)
-                diagnostic_request = question == (
-                    "What are the four document tools provided to the agent, and what does each tool return?"
+                diagnostic_request = (
+                    question == "What are the four document tools provided to the agent, and what does each tool return?"
+                    or self._tool_budget_question(question)
                 )
                 answer_diagnostics: dict[str, object] | None = None
                 if diagnostic_request:
@@ -375,9 +512,18 @@ class DocumentAgent:
                     )]
                     answer_diagnostics["validation_evidence"] = [
                         {"page_number": page.get("page_number"),
-                         "text": str(page.get("text", ""))[:3000]}
+                         "text": str(page.get("text", ""))[:10000],
+                         "text_truncated": len(str(page.get("text", ""))) > 10000}
                         for page in evidence.pages_read
                     ]
+                    if self._tool_budget_question(question):
+                        answer_diagnostics["budget_evidence_checks"] = [
+                            {"page_number": page.get("page_number"),
+                             "contains_tool_call_limit_and_quantity": self._page_supports_tool_budget(
+                                 str(page.get("text", ""))
+                             )}
+                            for page in evidence.pages_read
+                        ]
                 answer = self._validated_answer(provider_answer, question, evidence, answer_diagnostics)
                 run.record_answer_success(answer, answer_diagnostics)
             except Exception as exc:
