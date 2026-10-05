@@ -92,7 +92,17 @@ class DocumentRun:
     def record_answer_error(self, error: str) -> None:
         with self._lock:
             self.trace.append(DocumentToolEvent(tool_name="final_answer", arguments={},
-                call_number=len(self.trace) + 1, success=False, error=error))
+                call_number=len(self.trace) + 1, success=False,
+                result_metadata={"fallback": "evidence_only"}, error=error))
+
+    def record_answer_success(self, answer: str, diagnostics: dict[str, object] | None = None) -> None:
+        with self._lock:
+            metadata: dict[str, object] = {"source": "llm", "answer": answer}
+            if diagnostics is not None:
+                metadata["diagnostics"] = diagnostics
+            self.trace.append(DocumentToolEvent(tool_name="final_answer", arguments={},
+                call_number=len(self.trace) + 1, success=True,
+                result_metadata=metadata))
 
 
 class DocumentHarness:
