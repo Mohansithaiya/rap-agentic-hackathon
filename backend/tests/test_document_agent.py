@@ -89,6 +89,7 @@ def test_tool_failure_is_traced_and_agent_continues(monkeypatch):
     result = DocumentAgent(DocumentHarness(), llm).run("Question")
     assert result.trace[0].success is False
     assert "ValueError" in result.trace[0].error
+    assert result.calls_made == 1  # Failed execution attempts consume the same budget.
     assert result.answer == "Insufficient information."
 
 
@@ -160,3 +161,79 @@ def test_question_retry_cannot_reset_budget_but_independent_question_can(monkeyp
     independent = harness.new_question("different question")
     assert independent.remaining_calls == 6
     assert independent.call("list_documents", {}).success
+
+
+def test_agent_stops_after_six_tool_actions_and_still_answers(monkeypatch):
+    monkeypatch.setattr("app.documents.harness.tools.list_documents", lambda: type(
+        "R", (), {"model_dump": lambda self: {"documents": []}})())
+    llm = FakeLLM([action("list_documents") for _ in range(7)])
+    result = DocumentAgent(DocumentHarness(), llm).run("List docs")
+    assert result.calls_made == 6
+    assert result.remaining_calls == 0
+    assert llm.answer_calls == 1
+    assert len(result.trace) == 6
+
+
+def test_openai_compatible_adapter_uses_json_and_configured_settings(monkeypatch):
+    import json
+    from app.documents import llm as llm_module
+    from app.documents.agent import EvidenceState
+
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+
+            class Message:
+                content = json.dumps({"action_type": "tool", "tool_name": "list_documents", "arguments": {}})
+
+            return type("Response", (), {"choices": [type("Choice", (), {"message": Message()})()]})()
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs == {"api_key": "fake-secret", "base_url": "https://llm.example/v1"}
+            self.chat = type("Chat", (), {"completions": Completions()})()
+
+    monkeypatch.setattr(llm_module, "OpenAI", Client)
+    monkeypatch.setenv("DOCUMENT_LLM_API_KEY", "fake-secret")
+    monkeypatch.setenv("DOCUMENT_LLM_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("DOCUMENT_LLM_MODEL", "test-model")
+    adapter = llm_module.OpenAIDocumentLLM()
+    selected = adapter.choose_action("List docs", EvidenceState(), 6)
+
+    assert selected.tool_name == "list_documents"
+    assert requests[0]["model"] == "test-model"
+    assert requests[0]["response_format"] == {"type": "json_object"}
+    assert "search_keyword" in requests[0]["messages"][0]["content"]
+    assert "untrusted" in requests[0]["messages"][0]["content"]
+    assert not hasattr(adapter, "store")
+    assert not hasattr(adapter, "document_store")
+
+
+def test_final_answer_is_its_own_json_call(monkeypatch):
+    import json
+    from app.documents import llm as llm_module
+    from app.documents.agent import EvidenceState
+
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            content = json.dumps({"answer": "Insufficient information."})
+            return type("Response", (), {"choices": [type("Choice", (), {
+                "message": type("Message", (), {"content": content})()
+            })()]})()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = type("Chat", (), {"completions": Completions()})()
+
+    monkeypatch.setattr(llm_module, "OpenAI", Client)
+    monkeypatch.setenv("DOCUMENT_LLM_API_KEY", "fake-secret")
+    adapter = llm_module.OpenAIDocumentLLM()
+    assert adapter.answer("question", EvidenceState()) == "Insufficient information."
+    assert len(requests) == 1
+    assert "pages_read" in requests[0]["messages"][1]["content"]
+    assert "untrusted" in requests[0]["messages"][0]["content"]
